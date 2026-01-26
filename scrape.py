@@ -3,7 +3,8 @@
 
 """
 LDLC smartphone tracker (Excel history)
-- Scrapes LDLC listing pages for selected models (iPhone/Samsung/Pura/Xiaomi list)
+- Scrapes LDLC listing pages (smartphones category)
+- Keeps only: iPhone (Apple), Samsung, Xiaomi
 - Writes/updates an Excel file with:
     rows   = products (LDLC reference PBxxxx)
     cols   = runs (timestamp) containing price_eur
@@ -59,6 +60,9 @@ REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_PAGES_SEC = 1.0
 SLEEP_BETWEEN_PRODUCTS_SEC = 0.2  # when opening product pages for fallback price
 
+# Prix "raisonnable" max pour éviter les parsing foireux (Excel en E+11)
+MAX_REASONABLE_PRICE = 10000.0
+
 # =========================
 # Monitoring (advanced)
 # =========================
@@ -82,146 +86,38 @@ def save_state(state: dict):
 
 
 # =========================
-# Models to track (user list)
+# Brand filter (keep only iPhone/Samsung/Xiaomi)
 # =========================
 
-MODELES_AUTORISES = {
-    # iPhone 17
-    "Iphone 17 256Go Noir",
-    "Iphone 17 512Go Noir",
-    "Iphone 17 Air 256Go Noir",
-    "Iphone 17 Air 512Go Noir",
-    "Iphone 17 Air 1T Noir",
-    "Iphone 17 pro 256Go Noir",
-    "Iphone 17 pro 512Go Noir",
-    "Iphone 17 pro 1T Noir",
-    "Iphone 17 pro max 256 Go Noir",
-    "Iphone 17 pro max 512 Go Noir",
-    "Iphone 17 pro max 1T Noir Titane",
-    "Iphone 17 pro max 2T Noir Titane",
-    # iPhone 16
-    "Iphone 16 512Go Noir Titane",
-    "Iphone 16 256Go Noir Titane",
-    "Iphone 16 128Go Noir Titane",
-    "Iphone 16 plus 512Go Noir",
-    "Iphone 16 plus 256Go Noir",
-    "Iphone 16 plus 128Go Noir",
-    "Iphone 16 pro 1T Noir Titanium",
-    "Iphone 16 pro 512Go  Noir",
-    "Iphone 16 pro 256Go  Noir",
-    "Iphone 16 pro 128Go Noir",
-    "Iphone 16 pro max 1T Noir Titane",
-    "Iphone 16 pro max 512Go Noir Titane",
-    "Iphone 16 pro max 256Go Noir Titane",
-    # iPhone 15
-    "Iphone 15 512Go Noir",
-    "Iphone 15 256Go Noir",
-    "Iphone 15 128Go Noir",
-    "Iphone 15+ 512Go Noir",
-    "Iphone 15+ 256Go Noir",
-    "Iphone 15+ 128Go Noir",
-    "Iphone 15 pro 1T Noir Titanium",
-    "Iphone 15 pro 512Go Noir Titanium",
-    "Iphone 15 pro 256Go Noir Titanium",
-    "Iphone 15 pro 128Go Noir Titanium",
-    "Iphone 15 pro max 1T Noir Titane",
-    "Iphone 15 pro max 512Go Noir Titane",
-    "Iphone 15 pro max 256Go Noir Titane",
-    # iPhone 14
-    "Iphone 14 512Go Noir",
-    "Iphone 14 256Go Noir",
-    "Iphone 14 128Go Noir",
-    "Iphone 14+ 512Go Noir",
-    "Iphone 14+ 256Go Noir",
-    "Iphone 14+ 128Go Noir",
-    "Iphone 14 pro 512Go Noir",
-    "Iphone 14 pro 256Go Noir",
-    "Iphone 14 pro 128Go Noir",
-    "Iphone 14 pro max 1T Noir",
-    "Iphone 14 pro max 512Go Noir",
-    "Iphone 14 pro max 256Go Noir",
-    "Iphone 14 pro max 128Go Noir",
-    # Samsung
-    "S24",
-    "S24+",
-    "S24 ultra",
-    "S24 FE",
-    "S23",
-    "S23+",
-    "S23 ultra",
-    "S23 FE",
-    "S22",
-    "S22+",
-    "S22 ultra",
-    "S22 FE",
-    # Huawei Pura
-    "Pura 70",
-    "Pura 70 pro",
-    "Pura 70 ultra",
-    "Pura 60",
-    "Pura 60 pro",
-    "Pura 60 ultra",
-    "Pura 50",
-    "Pura 50 pro",
-    "Pura 50 ultra",
-    # Xiaomi
-    "Xiaomi 15",
-    "Xiaomi 15 pro",
-    "Xiaomi 14",
-    "Xiaomi 14 pro",
-    "Xiaomi 14 ultra",
-    "Xiaomi 13",
-    "Xiaomi 13 pro",
-    "Xiaomi 13 lite",
-}
-
-
-def normalize_model(s: str) -> str:
-    """
-    Normalization for matching titles robustly:
-    - lowercase
-    - remove brand noise words
-    - keep alnum + + and spaces
-    - normalize storage (go->go, to/tb->t)
-    - normalize multiple spaces
-    """
+def normalize_text(s: str) -> str:
     s = (s or "").lower()
-
-    # Remove frequent noise words (keep "xiaomi" and "pura" because part of model name)
-    for w in ["apple", "samsung", "galaxy", "smartphone", "phone", "huawei"]:
-        s = s.replace(w, " ")
-
-    # Keep letters/digits/+ and spaces
-    s = re.sub(r"[^0-9a-z+\s]", " ", s)
-
-    # Normalize storage units
-    s = s.replace(" go", "go")
-    s = s.replace(" to", "t")
-    s = s.replace(" tb", "t")
-
-    # Normalize spaces
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-MODELES_AUTORISES_NORMALISES = {normalize_model(m) for m in MODELES_AUTORISES if normalize_model(m)}
-
-
-def is_tracked_product(product_name: str) -> bool:
+def is_allowed_brand(product_name: str) -> bool:
     """
-    Returns True if product_name matches one of the allowed models.
-    Matching strategy:
-    - normalize product name
-    - check if any normalized allowed model is contained within the name OR the reverse
-      (helps with extra words like color variants, "5G", etc.)
+    Keep only:
+    - iPhone (Apple iPhone / iPhone)
+    - Samsung (Samsung / Galaxy)
+    - Xiaomi (Xiaomi)
     """
-    n = normalize_model(product_name)
+    n = normalize_text(product_name)
     if not n:
         return False
 
-    for m in MODELES_AUTORISES_NORMALISES:
-        if m in n or n in m:
-            return True
+    # iPhone
+    if "iphone" in n:
+        return True
+
+    # Samsung
+    if "samsung" in n or "galaxy" in n:
+        return True
+
+    # Xiaomi
+    if "xiaomi" in n:
+        return True
+
     return False
 
 
@@ -276,6 +172,10 @@ def format_euro(price: float) -> str:
     cents = int(round((price - euros) * 100))
     s = f"{euros:,}".replace(",", " ").replace(" ", "\xa0")
     return f"{s}€{cents:02d}"
+
+
+def price_is_sane(price: float) -> bool:
+    return price is not None and 0 < price <= MAX_REASONABLE_PRICE
 
 
 # =========================
@@ -335,7 +235,9 @@ def extract_price_dom(soup: BeautifulSoup):
 def get_price_from_product_page(product_url: str):
     soup = get_soup(product_url)
     price = extract_price_jsonld(soup) or extract_price_meta(soup) or extract_price_dom(soup)
-    return price, (format_euro(price) if price is not None else "")
+    if not price_is_sane(price):
+        return None, ""
+    return price, format_euro(price)
 
 
 # =========================
@@ -371,8 +273,8 @@ def scrape_listing_page(url: str):
         if not name:
             continue
 
-        # Filter by your specific models list
-        if not is_tracked_product(name):
+        # Keep only iPhone / Samsung / Xiaomi
+        if not is_allowed_brand(name):
             continue
 
         container = find_product_container(a)
@@ -384,9 +286,14 @@ def scrape_listing_page(url: str):
                 raw_price = "".join(el_price.stripped_strings)
                 price_eur = text_to_price(raw_price)
 
+        # Sanity check: si prix absurde => fallback produit
+        if not price_is_sane(price_eur):
+            price_eur = None
+            raw_price = None
+
         abs_url = urljoin(BASE_URL, href)
 
-        # Fallback to product page if listing price missing
+        # Fallback to product page if listing price missing or insane
         if price_eur is None:
             time.sleep(SLEEP_BETWEEN_PRODUCTS_SEC)
             price_eur, formatted = get_price_from_product_page(abs_url)
@@ -418,7 +325,7 @@ def scrape_all_pages():
             print(f"  !! Erreur page ({url}) : {e}")
             page_rows = []
 
-        print(f"  -> {len(page_rows)} produits gardés (après filtre)")
+        print(f"  -> {len(page_rows)} produits gardés (iPhone/Samsung/Xiaomi)")
         for r in page_rows:
             if r["reference"] not in seen:
                 all_rows.append(r)
@@ -472,7 +379,7 @@ def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
     # Add the new run column aligned on index (no overlap)
     df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
-    # Update name/url if changed
+    # Update name/url if changed (prefer current run)
     if "nom" in df_merged.columns:
         df_merged["nom"] = df_run["nom"].combine_first(df_merged["nom"])
     else:
@@ -502,7 +409,7 @@ def run_once():
     state = load_state()
 
     rows = scrape_all_pages()
-    print(f"Total produits uniques (après filtre) : {len(rows)}")
+    print(f"Total produits uniques (après filtre marque) : {len(rows)}")
 
     # Monitoring: empty run counter (fail only after N consecutive empty runs)
     if not rows:
