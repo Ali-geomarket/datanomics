@@ -3,21 +3,17 @@
 
 """
 LDLC smartphone tracker (Excel history)
-- Scrapes LDLC listing pages (smartphones category)
-- Keeps only: iPhone (Apple), Samsung, Xiaomi
+- Scrapes LDLC listing pages (smartphones)
+- Keeps iPhone / Samsung / Xiaomi (by brand keywords)
 - Writes/updates an Excel file with:
     rows   = products (LDLC reference PBxxxx)
     cols   = runs (timestamp) containing price_eur
 - Keeps history (adds a new timestamp column each run)
-- Designed to be GitHub-friendly (single file, requirements.txt ready)
-
-Usage:
-    python scrape.py
 
 Notes:
 - Be mindful of LDLC terms and reasonable request rate (sleep included).
-- This version includes "advanced monitoring":
-  it fails only after N consecutive empty runs (possible temporary block or HTML change).
+- Advanced monitoring:
+  fail only after N consecutive empty runs (possible temporary block / HTML change).
 """
 
 import os
@@ -58,10 +54,7 @@ SHEET_NAME = "Suivi"
 
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_PAGES_SEC = 1.0
-SLEEP_BETWEEN_PRODUCTS_SEC = 0.2  # when opening product pages for fallback price
-
-# Prix "raisonnable" max pour éviter les parsing foireux (Excel en E+11)
-MAX_REASONABLE_PRICE = 10000.0
+SLEEP_BETWEEN_PRODUCTS_SEC = 0.25
 
 # =========================
 # Monitoring (advanced)
@@ -86,39 +79,14 @@ def save_state(state: dict):
 
 
 # =========================
-# Brand filter (keep only iPhone/Samsung/Xiaomi)
+# Brand filter (KEEP ONLY THESE BRANDS)
 # =========================
-
-def normalize_text(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+ALLOWED_BRANDS = ("apple iphone", "samsung", "xiaomi")
 
 
-def is_allowed_brand(product_name: str) -> bool:
-    """
-    Keep only:
-    - iPhone (Apple iPhone / iPhone)
-    - Samsung (Samsung / Galaxy)
-    - Xiaomi (Xiaomi)
-    """
-    n = normalize_text(product_name)
-    if not n:
-        return False
-
-    # iPhone
-    if "iphone" in n:
-        return True
-
-    # Samsung
-    if "samsung" in n or "galaxy" in n:
-        return True
-
-    # Xiaomi
-    if "xiaomi" in n:
-        return True
-
-    return False
+def is_allowed_brand(name: str) -> bool:
+    n = (name or "").lower()
+    return any(b in n for b in ALLOWED_BRANDS)
 
 
 # =========================
@@ -138,31 +106,19 @@ def text_to_price(text: str):
 
     t = text.replace("\xa0", "").replace(" ", "").strip()
 
-    # Common formats: "1299€00" or "1299€"
+    # Ex: "1299€00" or "1299€"
     m = re.match(r"^(\d+)(?:€(\d{2}))?$", t)
     if m:
         euros = int(m.group(1))
         cents = int(m.group(2)) if m.group(2) else 0
         return euros + cents / 100
 
-    # Fallback: keep digits and separators
+    # Ex: "1 329€00" -> after cleanup might still have separators
     t = re.sub(r"[^\d,\.]", "", t).replace(",", ".")
     try:
         return float(t)
     except Exception:
         return None
-
-
-def find_product_container(a_tag):
-    """Climb up DOM to find a block that contains a '.price'."""
-    node = a_tag
-    for _ in range(7):
-        if node is None:
-            break
-        if node.select_one(".price"):
-            return node
-        node = node.parent
-    return None
 
 
 def format_euro(price: float) -> str:
@@ -174,8 +130,58 @@ def format_euro(price: float) -> str:
     return f"{s}€{cents:02d}"
 
 
-def price_is_sane(price: float) -> bool:
-    return price is not None and 0 < price <= MAX_REASONABLE_PRICE
+def find_product_container(a_tag):
+    """Climb up DOM to find a block that contains a price or a title."""
+    node = a_tag
+    for _ in range(10):
+        if node is None:
+            break
+        if node.select_one(".price") or node.select_one(".title, h3, .title-3"):
+            return node
+        node = node.parent
+    return None
+
+
+def extract_name_from_container(container: BeautifulSoup):
+    """Extract clean product name (avoid price glued into name)."""
+    if not container:
+        return ""
+
+    # Typical LDLC title places
+    for sel in [".title", ".title-3", "h3", "h2", ".product-title", ".txt span"]:
+        el = container.select_one(sel)
+        if el:
+            txt = " ".join(el.stripped_strings)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if txt:
+                return txt
+
+    # Fallback: any <a href="/fiche/...">
+    a = container.select_one('a[href^="/fiche/"]')
+    if a:
+        # take only first text chunk
+        parts = list(a.stripped_strings)
+        if parts:
+            return parts[0].strip()
+
+    return ""
+
+
+def extract_price_from_container(container: BeautifulSoup):
+    """Extract price from listing card container."""
+    if not container:
+        return None, None
+
+    # Try common selectors
+    for sel in [".price", ".sale-price", ".prod-cta .price", ".product-price"]:
+        el = container.select_one(sel)
+        if el:
+            raw = "".join(el.stripped_strings)
+            p = text_to_price(raw)
+            if p is not None:
+                return p, raw
+
+    return None, None
 
 
 # =========================
@@ -235,9 +241,7 @@ def extract_price_dom(soup: BeautifulSoup):
 def get_price_from_product_page(product_url: str):
     soup = get_soup(product_url)
     price = extract_price_jsonld(soup) or extract_price_meta(soup) or extract_price_dom(soup)
-    if not price_is_sane(price):
-        return None, ""
-    return price, format_euro(price)
+    return price, (format_euro(price) if price is not None else "")
 
 
 # =========================
@@ -261,15 +265,11 @@ def scrape_listing_page(url: str):
         if ref in seen_refs:
             continue
 
-        # Product name
-        name = a.get_text(strip=True) or ""
-        if not name:
-            parent = a.find_parent()
-            if parent:
-                title = parent.select_one(".title, .title-3, h3, .txt span")
-                if title:
-                    name = title.get_text(strip=True)
+        container = find_product_container(a)
+        abs_url = urljoin(BASE_URL, href)
 
+        # Clean name (avoid price glued)
+        name = extract_name_from_container(container)
         if not name:
             continue
 
@@ -277,27 +277,14 @@ def scrape_listing_page(url: str):
         if not is_allowed_brand(name):
             continue
 
-        container = find_product_container(a)
-        raw_price = None
-        price_eur = None
-        if container:
-            el_price = container.select_one(".price")
-            if el_price:
-                raw_price = "".join(el_price.stripped_strings)
-                price_eur = text_to_price(raw_price)
+        # Price from listing
+        price_eur, raw_price = extract_price_from_container(container)
 
-        # Sanity check: si prix absurde => fallback produit
-        if not price_is_sane(price_eur):
-            price_eur = None
-            raw_price = None
-
-        abs_url = urljoin(BASE_URL, href)
-
-        # Fallback to product page if listing price missing or insane
+        # Fallback to product page if missing
         if price_eur is None:
             time.sleep(SLEEP_BETWEEN_PRODUCTS_SEC)
             price_eur, formatted = get_price_from_product_page(abs_url)
-            raw_price = formatted if formatted else None
+            raw_price = formatted if formatted else raw_price
 
         rows.append(
             {
@@ -325,7 +312,7 @@ def scrape_all_pages():
             print(f"  !! Erreur page ({url}) : {e}")
             page_rows = []
 
-        print(f"  -> {len(page_rows)} produits gardés (iPhone/Samsung/Xiaomi)")
+        print(f"  -> {len(page_rows)} produits gardés (après filtre marque)")
         for r in page_rows:
             if r["reference"] not in seen:
                 all_rows.append(r)
@@ -333,7 +320,6 @@ def scrape_all_pages():
 
         time.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
-    # sort by price then name (None last)
     all_rows.sort(key=lambda x: (x["prix_eur"] if x["prix_eur"] is not None else 1e18, x["nom"]))
     return all_rows
 
@@ -373,26 +359,17 @@ def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
     else:
         df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
 
-    # Merge: keep all existing columns, then add/overwrite only the current run column
+    # Merge base (keeps all previous timestamps)
     df_merged = df_hist.combine_first(df_run)
 
-    # Add the new run column aligned on index (no overlap)
+    # Add/overwrite current run column safely
     df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
-    # Update name/url if changed (prefer current run)
-    if "nom" in df_merged.columns:
-        df_merged["nom"] = df_run["nom"].combine_first(df_merged["nom"])
-    else:
-        df_merged["nom"] = df_run["nom"]
-
-    if "url_produit" in df_merged.columns:
-        df_merged["url_produit"] = df_run["url_produit"].combine_first(df_merged["url_produit"])
-    else:
-        df_merged["url_produit"] = df_run["url_produit"]
+    # Update name/url if changed
+    df_merged["nom"] = df_run["nom"].combine_first(df_merged.get("nom"))
+    df_merged["url_produit"] = df_run["url_produit"].combine_first(df_merged.get("url_produit"))
 
     df_out = df_merged.reset_index()
-
-    # Sort by latest run column then name (None last)
     df_out = df_out.sort_values(by=[timestamp, "nom"], na_position="last")
 
     with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
@@ -416,7 +393,7 @@ def run_once():
         state["empty_runs"] = int(state.get("empty_runs", 0)) + 1
         save_state(state)
 
-        print(f"⚠️ Aucun produit récupéré. empty_runs={state['empty_runs']} (seuil={MAX_EMPTY_RUNS})")
+        print(f"Aucun produit récupéré. empty_runs={state['empty_runs']} (seuil={MAX_EMPTY_RUNS})")
         if state["empty_runs"] >= MAX_EMPTY_RUNS:
             raise RuntimeError(
                 f"Aucun produit récupéré pendant {state['empty_runs']} runs consécutifs. "
@@ -427,11 +404,6 @@ def run_once():
     # Reset counter on success
     state["empty_runs"] = 0
     save_state(state)
-
-    # Optional: quick preview
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        print(df.head(20).to_string(index=False))
 
     update_excel_history(rows)
 
