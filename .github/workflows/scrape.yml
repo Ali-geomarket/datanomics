@@ -3,7 +3,7 @@ name: LDLC tracker (monitoring)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # toutes les 30 minutes (UTC)
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: write
