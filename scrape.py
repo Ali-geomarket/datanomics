@@ -3,17 +3,18 @@
 
 """
 LDLC smartphone tracker (Excel history)
-- Scrapes LDLC listing pages (smartphones)
-- Keeps iPhone / Samsung / Xiaomi (by brand keywords)
+- Scrapes LDLC listing pages for Apple iPhone / Samsung / Xiaomi
 - Writes/updates an Excel file with:
     rows   = products (LDLC reference PBxxxx)
     cols   = runs (timestamp) containing price_eur
 - Keeps history (adds a new timestamp column each run)
 
+Usage:
+    python scrape.py
+
 Notes:
 - Be mindful of LDLC terms and reasonable request rate (sleep included).
-- Advanced monitoring:
-  fail only after N consecutive empty runs (possible temporary block / HTML change).
+- "Advanced monitoring": fails only after N consecutive empty runs.
 """
 
 import os
@@ -54,7 +55,7 @@ SHEET_NAME = "Suivi"
 
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_PAGES_SEC = 1.0
-SLEEP_BETWEEN_PRODUCTS_SEC = 0.25
+SLEEP_BETWEEN_PRODUCTS_SEC = 0.15  # fallback product pages only if price missing
 
 # =========================
 # Monitoring (advanced)
@@ -79,14 +80,21 @@ def save_state(state: dict):
 
 
 # =========================
-# Brand filter (KEEP ONLY THESE BRANDS)
+# Brand filter: keep all iPhone / Samsung / Xiaomi
 # =========================
-ALLOWED_BRANDS = ("apple iphone", "samsung", "xiaomi")
 
-
-def is_allowed_brand(name: str) -> bool:
-    n = (name or "").lower()
-    return any(b in n for b in ALLOWED_BRANDS)
+def is_target_brand(product_name: str) -> bool:
+    n = (product_name or "").lower()
+    # Apple: focus on iPhone only (avoids random Apple accessories if any)
+    if "iphone" in n:
+        return True
+    # Samsung phones
+    if "samsung" in n or "galaxy" in n:
+        return True
+    # Xiaomi phones (include Redmi/MIX/POCO if LDLC uses those labels)
+    if "xiaomi" in n or "redmi" in n or "poco" in n or "mix" in n:
+        return True
+    return False
 
 
 # =========================
@@ -99,89 +107,70 @@ def get_soup(url: str) -> BeautifulSoup:
     return BeautifulSoup(html.unescape(r.text), "lxml")
 
 
-def text_to_price(text: str):
-    """Convert LDLC price text to float EUR."""
+def _normalize_price_text(t: str) -> str:
+    # Keep NBSP as space, remove weird spacing
+    t = (t or "").replace("\xa0", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def extract_main_price_from_text(text: str):
+    """
+    Extract a "real" product price from a blob of text that may contain:
+    - old price + new price
+    - eco-part (3€07)
+    - installments (9 x 46€39)
+    Strategy:
+    - find all occurrences of "xxx€yy" (or "xxx€") in order
+    - keep candidates between 50 and 10000 euros (avoid eco-part & installments)
+    - if there are 2 candidates early (often old+new), pick the LAST of the first 2
+      -> handles promo blocks where old price appears before new price
+    """
     if not text:
         return None
 
-    t = text.replace("\xa0", "").replace(" ", "").strip()
+    t = _normalize_price_text(text)
 
-    # Ex: "1299€00" or "1299€"
-    m = re.match(r"^(\d+)(?:€(\d{2}))?$", t)
-    if m:
-        euros = int(m.group(1))
-        cents = int(m.group(2)) if m.group(2) else 0
-        return euros + cents / 100
+    # Match formats like:
+    # "1 329€00", "1329€00", "1329 € 00", "659€", "659€00"
+    pattern = re.compile(r"(\d[\d\s]*)\s*€\s*(\d{2})?")
+    matches = []
+    for m in pattern.finditer(t):
+        euros_raw = (m.group(1) or "").replace(" ", "")
+        cents_raw = m.group(2)
+        if not euros_raw.isdigit():
+            continue
+        euros = int(euros_raw)
+        cents = int(cents_raw) if (cents_raw and cents_raw.isdigit()) else 0
+        val = euros + cents / 100.0
+        matches.append((m.start(), val))
 
-    # Ex: "1 329€00" -> after cleanup might still have separators
-    t = re.sub(r"[^\d,\.]", "", t).replace(",", ".")
-    try:
-        return float(t)
-    except Exception:
+    if not matches:
         return None
 
+    # Filter out eco-part / monthly payments etc.
+    candidates = [val for (_pos, val) in matches if 50 <= val <= 10000]
 
-def format_euro(price: float) -> str:
-    if price is None:
-        return ""
-    euros = int(price)
-    cents = int(round((price - euros) * 100))
-    s = f"{euros:,}".replace(",", " ").replace(" ", "\xa0")
-    return f"{s}€{cents:02d}"
+    if not candidates:
+        # As a last resort, return the first parsed number
+        return matches[0][1]
+
+    # If promo: old then new; pick last among first two candidates
+    if len(candidates) >= 2:
+        return candidates[1]
+    return candidates[0]
 
 
 def find_product_container(a_tag):
-    """Climb up DOM to find a block that contains a price or a title."""
+    """Climb up DOM to find a block that contains a '.price'."""
     node = a_tag
-    for _ in range(10):
+    for _ in range(7):
         if node is None:
             break
-        if node.select_one(".price") or node.select_one(".title, h3, .title-3"):
+        if node.select_one(".price"):
             return node
         node = node.parent
     return None
-
-
-def extract_name_from_container(container: BeautifulSoup):
-    """Extract clean product name (avoid price glued into name)."""
-    if not container:
-        return ""
-
-    # Typical LDLC title places
-    for sel in [".title", ".title-3", "h3", "h2", ".product-title", ".txt span"]:
-        el = container.select_one(sel)
-        if el:
-            txt = " ".join(el.stripped_strings)
-            txt = re.sub(r"\s+", " ", txt).strip()
-            if txt:
-                return txt
-
-    # Fallback: any <a href="/fiche/...">
-    a = container.select_one('a[href^="/fiche/"]')
-    if a:
-        # take only first text chunk
-        parts = list(a.stripped_strings)
-        if parts:
-            return parts[0].strip()
-
-    return ""
-
-
-def extract_price_from_container(container: BeautifulSoup):
-    """Extract price from listing card container."""
-    if not container:
-        return None, None
-
-    # Try common selectors
-    for sel in [".price", ".sale-price", ".prod-cta .price", ".product-price"]:
-        el = container.select_one(sel)
-        if el:
-            raw = "".join(el.stripped_strings)
-            p = text_to_price(raw)
-            if p is not None:
-                return p, raw
-
-    return None, None
 
 
 # =========================
@@ -204,13 +193,17 @@ def extract_price_jsonld(soup: BeautifulSoup):
             if isinstance(node, dict):
                 offers = node.get("offers")
                 if isinstance(offers, dict) and "price" in offers:
-                    return text_to_price(str(offers["price"]))
+                    try:
+                        return float(str(offers["price"]).replace(",", "."))
+                    except Exception:
+                        pass
                 if isinstance(offers, list):
                     for of in offers:
                         if isinstance(of, dict) and "price" in of:
-                            return text_to_price(str(of["price"]))
-                if "price" in node:
-                    return text_to_price(str(node["price"]))
+                            try:
+                                return float(str(of["price"]).replace(",", "."))
+                            except Exception:
+                                pass
                 stack.extend(node.values())
             elif isinstance(node, list):
                 stack.extend(node)
@@ -225,23 +218,38 @@ def extract_price_meta(soup: BeautifulSoup):
     for sel, attr in selectors:
         el = soup.select_one(sel)
         if el and el.get(attr):
-            p = text_to_price(el.get(attr))
-            if p is not None:
-                return p
+            try:
+                return float(str(el.get(attr)).replace(",", "."))
+            except Exception:
+                pass
     return None
 
 
 def extract_price_dom(soup: BeautifulSoup):
-    el = soup.select_one(".price, .sale-price, .prod-cta .price, .product-price")
-    if el:
-        return text_to_price("".join(el.stripped_strings))
-    return None
+    # Try a few likely price containers; then parse with robust extractor.
+    selectors = [
+        ".price",
+        ".sale-price",
+        ".prod-cta .price",
+        ".product-price",
+        "[itemprop='price']",
+    ]
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        txt = " ".join(el.stripped_strings)
+        p = extract_main_price_from_text(txt)
+        if p is not None:
+            return p
+    # Fallback: search in whole page text (more expensive but robust)
+    page_txt = soup.get_text(" ", strip=True)
+    return extract_main_price_from_text(page_txt)
 
 
 def get_price_from_product_page(product_url: str):
     soup = get_soup(product_url)
-    price = extract_price_jsonld(soup) or extract_price_meta(soup) or extract_price_dom(soup)
-    return price, (format_euro(price) if price is not None else "")
+    return extract_price_jsonld(soup) or extract_price_meta(soup) or extract_price_dom(soup)
 
 
 # =========================
@@ -265,26 +273,41 @@ def scrape_listing_page(url: str):
         if ref in seen_refs:
             continue
 
-        container = find_product_container(a)
-        abs_url = urljoin(BASE_URL, href)
+        # Product name
+        name = a.get_text(strip=True) or ""
+        if not name:
+            parent = a.find_parent()
+            if parent:
+                title = parent.select_one(".title, .title-3, h3, .txt span")
+                if title:
+                    name = title.get_text(strip=True)
 
-        # Clean name (avoid price glued)
-        name = extract_name_from_container(container)
         if not name:
             continue
 
-        # Keep only iPhone / Samsung / Xiaomi
-        if not is_allowed_brand(name):
+        # Keep only iPhone/Samsung/Xiaomi
+        if not is_target_brand(name):
             continue
 
-        # Price from listing
-        price_eur, raw_price = extract_price_from_container(container)
+        container = find_product_container(a)
+        price_eur = None
 
-        # Fallback to product page if missing
+        if container:
+            el_price = container.select_one(".price")
+            if el_price:
+                # IMPORTANT: this block can contain old/new/eco-part/installments
+                txt_price = " ".join(el_price.stripped_strings)
+                price_eur = extract_main_price_from_text(txt_price)
+
+        abs_url = urljoin(BASE_URL, href)
+
+        # Fallback to product page if listing price missing
         if price_eur is None:
             time.sleep(SLEEP_BETWEEN_PRODUCTS_SEC)
-            price_eur, formatted = get_price_from_product_page(abs_url)
-            raw_price = formatted if formatted else raw_price
+            try:
+                price_eur = get_price_from_product_page(abs_url)
+            except Exception:
+                price_eur = None
 
         rows.append(
             {
@@ -292,7 +315,6 @@ def scrape_listing_page(url: str):
                 "nom": name,
                 "url_produit": abs_url,
                 "prix_eur": price_eur,
-                "prix_brut": raw_price,
             }
         )
         seen_refs.add(ref)
@@ -312,7 +334,7 @@ def scrape_all_pages():
             print(f"  !! Erreur page ({url}) : {e}")
             page_rows = []
 
-        print(f"  -> {len(page_rows)} produits gardés (après filtre marque)")
+        print(f"  -> {len(page_rows)} produits gardés (iPhone/Samsung/Xiaomi)")
         for r in page_rows:
             if r["reference"] not in seen:
                 all_rows.append(r)
@@ -320,6 +342,7 @@ def scrape_all_pages():
 
         time.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
+    # sort by price then name (None last)
     all_rows.sort(key=lambda x: (x["prix_eur"] if x["prix_eur"] is not None else 1e18, x["nom"]))
     return all_rows
 
@@ -359,19 +382,29 @@ def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
     else:
         df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
 
-    # Merge base (keeps all previous timestamps)
+    # Merge: keep all existing columns, then add/overwrite only the current run column
     df_merged = df_hist.combine_first(df_run)
 
-    # Add/overwrite current run column safely
+    # Add the new run column aligned on index
     df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
     # Update name/url if changed
-    df_merged["nom"] = df_run["nom"].combine_first(df_merged.get("nom"))
-    df_merged["url_produit"] = df_run["url_produit"].combine_first(df_merged.get("url_produit"))
+    if "nom" in df_merged.columns:
+        df_merged["nom"] = df_run["nom"].combine_first(df_merged["nom"])
+    else:
+        df_merged["nom"] = df_run["nom"]
+
+    if "url_produit" in df_merged.columns:
+        df_merged["url_produit"] = df_run["url_produit"].combine_first(df_merged["url_produit"])
+    else:
+        df_merged["url_produit"] = df_run["url_produit"]
 
     df_out = df_merged.reset_index()
+
+    # Sort by latest run column then name (None last)
     df_out = df_out.sort_values(by=[timestamp, "nom"], na_position="last")
 
+    # This overwrites the XLSX file, but keeps ALL history columns inside it.
     with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
         df_out.to_excel(writer, sheet_name=sheet_name, index=False)
 
@@ -386,9 +419,9 @@ def run_once():
     state = load_state()
 
     rows = scrape_all_pages()
-    print(f"Total produits uniques (après filtre marque) : {len(rows)}")
+    print(f"Total produits uniques gardés : {len(rows)}")
 
-    # Monitoring: empty run counter (fail only after N consecutive empty runs)
+    # Monitoring: empty run counter
     if not rows:
         state["empty_runs"] = int(state.get("empty_runs", 0)) + 1
         save_state(state)
@@ -404,6 +437,11 @@ def run_once():
     # Reset counter on success
     state["empty_runs"] = 0
     save_state(state)
+
+    # Optional preview
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        print(df.head(25).to_string(index=False))
 
     update_excel_history(rows)
 
