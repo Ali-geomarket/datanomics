@@ -466,9 +466,11 @@ def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
     else:
         df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
 
-    # Merge & add run column
+    # Merge: keep all existing columns, then add/overwrite only the current run column
     df_merged = df_hist.combine_first(df_run)
-    df_merged = df_merged.join(df_run[[timestamp]], how="outer")
+
+    # Add the new run column aligned on index (no overlap)
+    df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
     # Update name/url if changed
     if "nom" in df_merged.columns:
