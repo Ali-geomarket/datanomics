@@ -11,10 +11,12 @@ LDLC smartphone tracker (Excel history)
 - Designed to be GitHub-friendly (single file, requirements.txt ready)
 
 Usage:
-    python ldlc_tracker.py
+    python scrape.py
 
 Notes:
 - Be mindful of LDLC terms and reasonable request rate (sleep included).
+- This version includes "advanced monitoring":
+  it fails only after N consecutive empty runs (possible temporary block or HTML change).
 """
 
 import os
@@ -50,15 +52,33 @@ HEADERS_HTTP = {
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# 30 minutes
-INTERVAL_SECONDS = 1800
-
 EXCEL_FILE = "ldlc_suivi_smartphones.xlsx"
 SHEET_NAME = "Suivi"
 
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_PAGES_SEC = 1.0
 SLEEP_BETWEEN_PRODUCTS_SEC = 0.2  # when opening product pages for fallback price
+
+# =========================
+# Monitoring (advanced)
+# =========================
+STATE_FILE = "state.json"
+MAX_EMPTY_RUNS = 3  # fail only after 3 consecutive empty runs
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"empty_runs": 0}
+
+
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 # =========================
@@ -473,12 +493,31 @@ def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
 
 
 # =========================
-# Main loop
+# Main (one run per execution)
 # =========================
 
 def run_once():
+    state = load_state()
+
     rows = scrape_all_pages()
     print(f"Total produits uniques (après filtre) : {len(rows)}")
+
+    # Monitoring: empty run counter (fail only after N consecutive empty runs)
+    if not rows:
+        state["empty_runs"] = int(state.get("empty_runs", 0)) + 1
+        save_state(state)
+
+        print(f"⚠️ Aucun produit récupéré. empty_runs={state['empty_runs']} (seuil={MAX_EMPTY_RUNS})")
+        if state["empty_runs"] >= MAX_EMPTY_RUNS:
+            raise RuntimeError(
+                f"Aucun produit récupéré pendant {state['empty_runs']} runs consécutifs. "
+                "Blocage LDLC, changement HTML ou problème réseau probable."
+            )
+        return
+
+    # Reset counter on success
+    state["empty_runs"] = 0
+    save_state(state)
 
     # Optional: quick preview
     df = pd.DataFrame(rows)
@@ -487,21 +526,6 @@ def run_once():
 
     update_excel_history(rows)
 
-
-def main():
-    while True:
-        start = time.strftime("%Y-%m-%d %H:%M:%S")
-        print("\n" + "=" * 80)
-        print(f"Nouvelle exécution du scraping : {start}")
-        print("=" * 80)
-
-        try:
-            run_once()
-        except Exception as e:
-            print(f"ERREUR pendant l'exécution : {e}")
-
-        print(f"Pause de {INTERVAL_SECONDS} secondes (30 min) avant la prochaine exécution...")
-        time.sleep(INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     run_once()
