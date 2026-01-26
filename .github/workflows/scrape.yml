@@ -35,6 +35,7 @@ jobs:
         run: |
           python scrape.py
 
+      # Optionnel: garder aussi un artifact téléchargeable
       - name: Upload Excel artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -42,11 +43,17 @@ jobs:
           name: ldlc_suivi_smartphones
           path: ldlc_suivi_smartphones.xlsx
 
-      - name: Commit state file (empty run counter)
+      - name: Commit Excel + state
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json || true
-          git commit -m "Update monitoring state" || echo "No changes to commit"
+
+          # Ajoute excel + state (state existe peut-être déjà)
+          git add ldlc_suivi_smartphones.xlsx state.json || true
+
+          # Commit seulement si changements
+          git commit -m "Update LDLC prices history" || echo "No changes to commit"
+
+          # Push
           git push
