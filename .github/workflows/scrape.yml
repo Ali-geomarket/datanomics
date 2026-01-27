@@ -17,7 +17,7 @@ concurrency:
   # Un seul run à la fois pour éviter des exécutions concurrentes sur le même fichier
   group: ldlc-tracker
   # Si un run est déjà en cours au moment d'un nouveau déclenchement, on attend (on n'annule pas)
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:
