@@ -1,24 +1,33 @@
 name: LDLC tracker (monitoring)
 
 on:
+  # Lancement manuel depuis l'interface GitHub (bouton "Run workflow")
   workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
 
+  # Lancement automatique via cron (toutes les heures, à minute 0)
+  # Format cron GitHub : minute heure jour(mois) mois jour(semaine)
+  schedule:
+    - cron: "0 * * * *"
+
+# Permissions nécessaires pour pouvoir pousser des fichiers (Excel + state.json) dans le dépôt
 permissions:
   contents: write
 
 concurrency:
+  # Un seul run à la fois pour éviter des exécutions concurrentes sur le même fichier
   group: ldlc-tracker
-  cancel-in-progress: true
+  # Si un run est déjà en cours au moment d'un nouveau déclenchement, on attend (on n'annule pas)
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+
+    # Augmenté car le scraping + génération Excel peut dépasser 20 minutes selon la charge réseau
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -35,7 +44,8 @@ jobs:
         run: |
           python scrape.py
 
-      # Optionnel: garder aussi un artifact téléchargeable
+      # Conservation d'un artifact téléchargeable depuis l'interface GitHub Actions.
+      # Important : le fichier doit exister à ce chemin à la fin du script (ici, à la racine du repo).
       - name: Upload Excel artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -43,17 +53,19 @@ jobs:
           name: ldlc_suivi_smartphones
           path: ldlc_suivi_smartphones.xlsx
 
+      # Commit/push des fichiers produits afin de garder un historique dans le dépôt.
+      # Si aucun changement, le commit est ignoré.
       - name: Commit Excel + state
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Ajoute excel + state (state existe peut-être déjà)
+          # Ajoute l'excel et le fichier d'état (state.json) si présents/modifiés
           git add ldlc_suivi_smartphones.xlsx state.json || true
 
-          # Commit seulement si changements
+          # Commit uniquement si changements
           git commit -m "Update LDLC prices history" || echo "No changes to commit"
 
-          # Push
+          # Push sur la branche courante
           git push
