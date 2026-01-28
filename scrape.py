@@ -6,30 +6,20 @@ LDLC smartphone tracker (Excel history)
 
 Objectif
 --------
-Ce script surveille les prix de smartphones sur LDLC en conservant un historique dans un fichier Excel.
+- Parcourir les pages "listing" LDLC de smartphones
+- Garder uniquement Apple iPhone / Samsung / Xiaomi
+- Enregistrer un historique des prix dans un fichier Excel :
+    lignes  = produits (référence LDLC de type PBxxxx)
+    colonnes = exécutions (horodatage), avec le prix en euros
 
-Principe
---------
-1) Le script parcourt plusieurs pages de la catégorie "mobile-smartphone" (pagination incluse).
-2) Il ne conserve que certaines marques/modèles (iPhone, Samsung/Galaxy, Xiaomi/Redmi/POCO/MIX).
-3) Pour chaque produit, il tente d'extraire le prix depuis la page de listing.
-   - Si le prix est absent ou ambigu, il peut faire un "fallback" sur la fiche produit (plus coûteux).
-4) Il met à jour un fichier Excel :
-   - lignes = produits (référence LDLC de type PBxxxx)
-   - colonnes = exécutions (timestamp) avec le prix en euros
-   - l'historique est conservé : à chaque run, une nouvelle colonne timestamp est ajoutée.
-
-Robustesse (monitoring)
------------------------
-- Le script maintient un compteur de "runs vides" dans state.json.
-- Il ne plante qu'après MAX_EMPTY_RUNS exécutions consécutives sans aucun produit récupéré.
-  (ex : blocage LDLC, changement HTML, problème réseau).
-- Pour éviter l'erreur "artifact introuvable" côté GitHub Actions, un fichier Excel minimal
-  est créé s'il n'existe pas encore (même en cas de run vide).
-
-Usage
------
-python scrape.py
+Points d’attention
+------------------
+- LDLC affiche parfois des montants type "€/mois" ou "3 x ..." : ce ne sont pas les prix comptants.
+  Le script filtre ces montants pour garder le prix final (ex: 169,95€).
+- Pour éviter les échecs après un certain nombre de requêtes :
+  utilisation d'une session HTTP + retries + temporisations raisonnables.
+- Si une exécution ne remonte aucun produit, on n’échoue pas immédiatement :
+  on échoue seulement après N runs consécutifs vides (monitoring).
 """
 
 import os
@@ -46,7 +36,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # =========================
-# Configuration générale
+# Configuration
 # =========================
 
 BASE_URL = "https://www.ldlc.com"
@@ -63,31 +53,36 @@ PAGES_LISTE = [
 ]
 
 HEADERS_HTTP = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
+        "Gecko/20100101 Firefox/123.0"
+    ),
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
 
 EXCEL_FILE = "ldlc_suivi_smartphones.xlsx"
 SHEET_NAME = "Suivi"
 
 REQUEST_TIMEOUT = 30
-SLEEP_BETWEEN_PAGES_SEC = 1.0
-SLEEP_BETWEEN_PRODUCTS_SEC = 0.15  # délai avant de charger une fiche produit (fallback)
 
-# Pour limiter le temps d'exécution : on borne le nombre de fallbacks "fiche produit".
-# Au-delà, on garde prix_eur=None (et l'historique Excel contiendra une valeur manquante).
-MAX_FALLBACK_PRODUCT_PAGES = 80
+# Si tu vois des 403/429 après ~100 produits, augmente un peu les sleeps
+SLEEP_BETWEEN_PAGES_SEC = 1.2
+SLEEP_BETWEEN_PRODUCTS_SEC = 0.35
+
+# Limite le nombre de "fallback" vers fiche produit par run (réduit fortement le risque de blocage)
+MAX_FALLBACK_PRODUCT_PAGES = 60
 
 # =========================
 # Monitoring (advanced)
 # =========================
 
 STATE_FILE = "state.json"
-MAX_EMPTY_RUNS = 3  # échec après 3 runs consécutifs sans aucun produit récupéré
+MAX_EMPTY_RUNS = 3  # échec uniquement après 3 runs consécutifs vides
 
 
-def load_state() -> dict:
-    """Charge l'état de monitoring (compteur de runs vides)."""
+def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -97,52 +92,45 @@ def load_state() -> dict:
     return {"empty_runs": 0}
 
 
-def save_state(state: dict) -> None:
-    """Sauvegarde l'état de monitoring dans state.json."""
+def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def ensure_excel_exists(excel_file: str = EXCEL_FILE, sheet_name: str = SHEET_NAME) -> None:
-    """
-    Crée un fichier Excel minimal s'il n'existe pas.
-    Objectif : éviter que GitHub Actions échoue sur l'upload d'artifact si un run est vide.
-    """
-    if os.path.exists(excel_file):
-        return
+# =========================
+# Filtre marque
+# =========================
 
-    df_empty = pd.DataFrame(columns=["reference", "nom", "url_produit"])
-    with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
-        df_empty.to_excel(writer, sheet_name=sheet_name, index=False)
-
-    print(f"Fichier Excel initialisé (vide) : {excel_file}")
+def is_target_brand(product_name: str) -> bool:
+    n = (product_name or "").lower()
+    if "iphone" in n:
+        return True
+    if "samsung" in n or "galaxy" in n:
+        return True
+    if "xiaomi" in n or "redmi" in n or "poco" in n:
+        return True
+    return False
 
 
 # =========================
-# Session HTTP avec retries
+# Session HTTP + retries
 # =========================
 
 def build_session() -> requests.Session:
     """
-    Construit une session HTTP avec stratégie de retry.
-    Intérêt :
-    - amortir les erreurs transitoires (429/5xx, timeouts),
-    - réduire le risque de run vide dû à des soucis réseau ponctuels.
+    Session requests avec retries sur erreurs réseau et codes fréquents de limitation (429) / serveur.
     """
     session = requests.Session()
     session.headers.update(HEADERS_HTTP)
 
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
+        total=4,
+        backoff_factor=1.2,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
         raise_on_status=False,
     )
-
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -151,98 +139,108 @@ def build_session() -> requests.Session:
 SESSION = build_session()
 
 
-# =========================
-# Filtre marques : iPhone / Samsung / Xiaomi
-# =========================
-
-def is_target_brand(product_name: str) -> bool:
-    """
-    Filtre simple sur le nom produit :
-    - Apple : uniquement iPhone
-    - Samsung : "samsung" ou "galaxy"
-    - Xiaomi : "xiaomi" ou "redmi" ou "poco" ou "mix"
-    """
-    n = (product_name or "").lower()
-
-    if "iphone" in n:
-        return True
-    if "samsung" in n or "galaxy" in n:
-        return True
-    if "xiaomi" in n or "redmi" in n or "poco" in n or "mix" in n:
-        return True
-    return False
-
-
-# =========================
-# Utilitaires parsing / extraction prix
-# =========================
-
 def get_soup(url: str) -> BeautifulSoup:
-    """
-    Télécharge une page et retourne un objet BeautifulSoup.
-    """
     r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    # Log minimal utile si LDLC limite
+    if r.status_code >= 400:
+        print(f"  !! HTTP {r.status_code} sur {url}")
     r.raise_for_status()
     return BeautifulSoup(html.unescape(r.text), "lxml")
 
 
-def _normalize_price_text(t: str) -> str:
-    """
-    Normalise un texte contenant un prix : espaces, NBSP, etc.
-    """
-    t = (t or "").replace("\xa0", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# =========================
+# Extraction prix robuste
+# =========================
+
+def _normalize_spaces(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def extract_main_price_from_text(text: str):
+def _is_installment_context(text: str, span_start: int, span_end: int) -> bool:
     """
-    Extrait un prix "principal" depuis un texte susceptible de contenir :
-    - ancien prix + nouveau prix,
-    - éco-participation (ex: 3€07),
-    - paiements en plusieurs fois (ex: 9 x 46€39).
+    Détecte si un montant est dans un contexte de mensualité / paiement en plusieurs fois.
+    On regarde un voisinage autour du montant.
+    """
+    left = max(0, span_start - 18)
+    right = min(len(text), span_end + 18)
+    ctx = text[left:right].lower()
+
+    # Signaux typiques de mensualités / paiement fractionné
+    # (ex: "3 x 58€58", "x 46€39", "€/mois", "par mois", "mensuel", "à partir de")
+    if re.search(r"(\b\d+\s*[x×]\s*$)", text[left:span_start].lower()):
+        return True
+    if "€/mois" in ctx or "par mois" in ctx or "mensuel" in ctx:
+        return True
+    if re.search(r"\b\d+\s*[x×]\s*\d", ctx):
+        return True
+    if "payer mensuellement" in ctx or "paiement" in ctx:
+        return True
+    if "a partir de" in ctx or "à partir de" in ctx:
+        return True
+
+    return False
+
+
+def extract_cash_price(text: str):
+    """
+    Extrait le prix comptant le plus probable à partir d'un bloc texte.
 
     Méthode :
-    - on extrait toutes les occurrences "xxx€yy" ou "xxx€",
-    - on filtre sur une plage plausible (50 à 10000 euros),
-    - si deux candidats sont présents (souvent old/new), on prend le second.
+    - on récupère toutes les occurrences "xxx€yy"
+    - on supprime les montants associés à une mensualité (x fois, €/mois, etc.)
+    - on supprime les montants trop faibles (éco-part typiquement 3€05)
+    - on garde un prix plausible smartphone et on prend le meilleur candidat
     """
     if not text:
         return None
 
-    t = _normalize_price_text(text)
+    t = _normalize_spaces(text)
 
     pattern = re.compile(r"(\d[\d\s]*)\s*€\s*(\d{2})?")
-    matches = []
+    found = []
+
     for m in pattern.finditer(t):
         euros_raw = (m.group(1) or "").replace(" ", "")
         cents_raw = m.group(2)
+
         if not euros_raw.isdigit():
             continue
+
         euros = int(euros_raw)
         cents = int(cents_raw) if (cents_raw and cents_raw.isdigit()) else 0
         val = euros + cents / 100.0
-        matches.append(val)
 
-    if not matches:
+        found.append((m.start(), m.end(), val))
+
+    if not found:
         return None
 
-    candidates = [v for v in matches if 50 <= v <= 10000]
-    if not candidates:
-        return matches[0]
+    # 1) écarte les contextes "mensualités"
+    candidates = []
+    for start, end, val in found:
+        if _is_installment_context(t, start, end):
+            continue
+        candidates.append(val)
 
-    if len(candidates) >= 2:
-        return candidates[1]
-    return candidates[0]
+    # 2) écarte les montants trop faibles (éco-part, frais…)
+    candidates = [v for v in candidates if v >= 30]
+
+    if not candidates:
+        # En dernier recours, prendre le maximum trouvé (ça évite souvent de garder la mensualité)
+        return max(v for (_s, _e, v) in found)
+
+    # 3) règle simple : le prix comptant est généralement le plus élevé parmi les candidats filtrés
+    return max(candidates)
 
 
 def find_product_container(a_tag):
     """
-    Remonte dans le DOM depuis le lien produit pour trouver un bloc parent contenant ".price".
-    L'objectif est d'associer un lien produit à sa zone prix sur la page listing.
+    Remonte dans le DOM pour trouver un bloc parent contenant une zone de prix.
     """
     node = a_tag
-    for _ in range(7):
+    for _ in range(10):
         if node is None:
             break
         if node.select_one(".price"):
@@ -252,12 +250,13 @@ def find_product_container(a_tag):
 
 
 # =========================
-# Fallback prix : fiche produit
+# Fallback fiche produit
 # =========================
 
 def extract_price_jsonld(soup: BeautifulSoup):
     """
-    Cherche un prix dans les scripts JSON-LD (données structurées).
+    Les fiches produit contiennent souvent du JSON-LD avec offers.price.
+    C’est généralement la source la plus fiable (prix comptant).
     """
     for s in soup.select('script[type="application/ld+json"]'):
         txt = s.string or s.text
@@ -293,7 +292,7 @@ def extract_price_jsonld(soup: BeautifulSoup):
 
 def extract_price_meta(soup: BeautifulSoup):
     """
-    Cherche un prix dans des balises meta (itemprop / OpenGraph).
+    Alternative : meta itemprop=price ou OpenGraph.
     """
     selectors = [
         ('meta[itemprop="price"]', "content"),
@@ -311,7 +310,7 @@ def extract_price_meta(soup: BeautifulSoup):
 
 def extract_price_dom(soup: BeautifulSoup):
     """
-    Cherche un prix dans le DOM via des sélecteurs probables, puis parse le texte.
+    Dernier recours : extraction dans le DOM via classes usuelles + filtre mensualités.
     """
     selectors = [
         ".price",
@@ -325,34 +324,24 @@ def extract_price_dom(soup: BeautifulSoup):
         if not el:
             continue
         txt = " ".join(el.stripped_strings)
-        p = extract_main_price_from_text(txt)
+        p = extract_cash_price(txt)
         if p is not None:
             return p
 
     page_txt = soup.get_text(" ", strip=True)
-    return extract_main_price_from_text(page_txt)
+    return extract_cash_price(page_txt)
 
 
 def get_price_from_product_page(product_url: str):
-    """
-    Extrait le prix depuis la fiche produit (plus lent qu'un listing).
-    """
     soup = get_soup(product_url)
     return extract_price_jsonld(soup) or extract_price_meta(soup) or extract_price_dom(soup)
 
 
 # =========================
-# Scraping pages listing
+# Scraping listing pages
 # =========================
 
 def scrape_listing_page(url: str, fallback_budget: dict):
-    """
-    Scrape une page listing :
-    - récupère les liens produits /fiche/PBxxxx.html
-    - filtre marques
-    - extrait le prix depuis le listing
-    - fallback fiche produit si nécessaire et si budget fallback non épuisé
-    """
     soup = get_soup(url)
     links = soup.select('a[href^="/fiche/"]')
 
@@ -378,33 +367,29 @@ def scrape_listing_page(url: str, fallback_budget: dict):
                 if title:
                     name = title.get_text(strip=True)
 
-        if not name:
+        if not name or not is_target_brand(name):
             continue
 
-        if not is_target_brand(name):
-            continue
+        abs_url = urljoin(BASE_URL, href)
 
-        container = find_product_container(a)
+        # Prix depuis le listing si possible
         price_eur = None
-
-        # Extraction prix depuis le listing
+        container = find_product_container(a)
         if container:
             el_price = container.select_one(".price")
             if el_price:
                 txt_price = " ".join(el_price.stripped_strings)
-                price_eur = extract_main_price_from_text(txt_price)
+                price_eur = extract_cash_price(txt_price)
 
-        abs_url = urljoin(BASE_URL, href)
-
-        # Fallback fiche produit (limité par MAX_FALLBACK_PRODUCT_PAGES)
-        if price_eur is None and fallback_budget["remaining"] > 0:
+        # Fallback fiche produit uniquement si nécessaire + budget limité
+        if price_eur is None and fallback_budget["used"] < fallback_budget["max"]:
+            fallback_budget["used"] += 1
             time.sleep(SLEEP_BETWEEN_PRODUCTS_SEC)
             try:
                 price_eur = get_price_from_product_page(abs_url)
-            except Exception:
+            except Exception as e:
+                print(f"  !! Fallback KO {ref} ({abs_url}) : {e}")
                 price_eur = None
-            finally:
-                fallback_budget["remaining"] -= 1
 
         rows.append(
             {
@@ -420,23 +405,21 @@ def scrape_listing_page(url: str, fallback_budget: dict):
 
 
 def scrape_all_pages():
-    """
-    Scrape l'ensemble des pages configurées et déduplique par référence produit.
-    """
     all_rows = []
     seen = set()
 
-    fallback_budget = {"remaining": MAX_FALLBACK_PRODUCT_PAGES}
+    fallback_budget = {"used": 0, "max": MAX_FALLBACK_PRODUCT_PAGES}
 
     for url in PAGES_LISTE:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Page: {url}")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Listing: {url}")
         try:
-            page_rows = scrape_listing_page(url, fallback_budget=fallback_budget)
+            page_rows = scrape_listing_page(url, fallback_budget)
         except Exception as e:
-            print(f"Erreur lors du scraping de la page ({url}) : {e}")
+            print(f"  !! Erreur listing ({url}) : {e}")
             page_rows = []
 
-        print(f"  Produits conservés (iPhone/Samsung/Xiaomi) : {len(page_rows)}")
+        print(f"  -> {len(page_rows)} produits retenus | fallback_used={fallback_budget['used']}/{fallback_budget['max']}")
+
         for r in page_rows:
             if r["reference"] not in seen:
                 all_rows.append(r)
@@ -444,114 +427,96 @@ def scrape_all_pages():
 
         time.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
-    # Tri : prix croissant, puis nom. Les prix manquants vont à la fin.
     all_rows.sort(key=lambda x: (x["prix_eur"] if x["prix_eur"] is not None else 1e18, x["nom"]))
-    print(f"Budget fallback restant (fiches produit) : {fallback_budget['remaining']}")
     return all_rows
 
 
 # =========================
-# Historisation Excel
+# Excel history
 # =========================
 
 def update_excel_history(rows, excel_file=EXCEL_FILE, sheet_name=SHEET_NAME):
-    """
-    Met à jour l'historique Excel.
-
-    - Chaque run ajoute une nouvelle colonne horodatée contenant le prix (prix_eur).
-    - Les colonnes "nom" et "url_produit" sont maintenues (et mises à jour si changement).
-    - On conserve toutes les colonnes existantes (historique complet).
-    """
-    ensure_excel_exists(excel_file=excel_file, sheet_name=sheet_name)
-
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
     df_run = pd.DataFrame(rows).copy()
     if df_run.empty:
-        print("Aucun produit trouvé : aucun ajout de colonne timestamp.")
+        print("Aucun produit -> Excel non modifié.")
         return
 
     df_run[timestamp] = df_run["prix_eur"]
-    df_run = df_run.set_index("reference")[["nom", "url_produit", timestamp]]
+    df_run = df_run.set_index("reference")
+    df_run = df_run[["nom", "url_produit", timestamp]]
 
-    # Chargement de l'historique existant
-    try:
-        df_hist = pd.read_excel(excel_file, sheet_name=sheet_name, engine="openpyxl")
-        if not df_hist.empty and "reference" in df_hist.columns:
-            df_hist = df_hist.set_index("reference")
-        else:
+    # Chargement historique
+    if os.path.exists(excel_file):
+        try:
+            df_hist = pd.read_excel(excel_file, sheet_name=sheet_name, engine="openpyxl")
+            if not df_hist.empty and "reference" in df_hist.columns:
+                df_hist = df_hist.set_index("reference")
+            else:
+                df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
+        except Exception as e:
+            print(f"Lecture Excel impossible ({e}). Recréation.")
             df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
-    except Exception as e:
-        print(f"Impossible de lire l'Excel existant ({e}). Recréation d'un historique vide.")
+    else:
         df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
 
-    # On travaille sur l'union des références (anciennes + nouvelles)
-    idx = df_hist.index.union(df_run.index)
-    df_merged = df_hist.reindex(idx)
+    # Merge
+    df_merged = df_hist.combine_first(df_run)
+    df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
-    # Assure l'existence de colonnes structurelles
-    for col in ("nom", "url_produit"):
-        if col not in df_merged.columns:
-            df_merged[col] = pd.NA
+    # Mise à jour nom / url si changent
+    if "nom" in df_merged.columns:
+        df_merged["nom"] = df_run["nom"].combine_first(df_merged["nom"])
+    else:
+        df_merged["nom"] = df_run["nom"]
 
-    # Mise à jour nom/url : priorité aux valeurs du run courant quand elles existent
-    df_merged["nom"] = df_run["nom"].reindex(idx).combine_first(df_merged["nom"])
-    df_merged["url_produit"] = df_run["url_produit"].reindex(idx).combine_first(df_merged["url_produit"])
-
-    # Ajout de la colonne timestamp pour ce run (prix)
-    df_merged[timestamp] = df_run[timestamp].reindex(idx)
+    if "url_produit" in df_merged.columns:
+        df_merged["url_produit"] = df_run["url_produit"].combine_first(df_merged["url_produit"])
+    else:
+        df_merged["url_produit"] = df_run["url_produit"]
 
     df_out = df_merged.reset_index()
-
-    # Tri : on privilégie la colonne du dernier run (timestamp), puis le nom
     df_out = df_out.sort_values(by=[timestamp, "nom"], na_position="last")
 
     with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
         df_out.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    print(f"Excel mis à jour : {excel_file} | run = {timestamp} | nb_produits_run = {len(df_run)}")
+    print(f"Excel mis à jour : {excel_file} | run={timestamp} | produits={len(df_run)}")
 
 
 # =========================
-# Exécution (un run par lancement)
+# Main
 # =========================
 
 def run_once():
-    """
-    Exécute un cycle complet :
-    - scraping
-    - monitoring runs vides
-    - mise à jour Excel si données présentes
-    """
-    ensure_excel_exists()
-
     state = load_state()
 
     rows = scrape_all_pages()
-    print(f"Total produits uniques conservés : {len(rows)}")
+    print(f"Total produits uniques : {len(rows)}")
 
-    # Monitoring : gestion des runs vides
+    # Monitoring runs vides
     if not rows:
         state["empty_runs"] = int(state.get("empty_runs", 0)) + 1
         save_state(state)
 
         print(f"Aucun produit récupéré. empty_runs={state['empty_runs']} (seuil={MAX_EMPTY_RUNS})")
-
         if state["empty_runs"] >= MAX_EMPTY_RUNS:
             raise RuntimeError(
                 f"Aucun produit récupéré pendant {state['empty_runs']} runs consécutifs. "
-                "Cause probable : blocage, changement HTML ou problème réseau."
+                "Changement LDLC / blocage / réseau probable."
             )
         return
 
-    # Reset compteur si run non vide
     state["empty_runs"] = 0
     save_state(state)
 
-    # Affichage d'un échantillon (utile dans les logs GitHub Actions)
-    df_preview = pd.DataFrame(rows)
-    if not df_preview.empty:
-        print(df_preview.head(25).to_string(index=False))
+    # Aperçu console
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        missing = df["prix_eur"].isna().sum()
+        print(df.head(20).to_string(index=False))
+        print(f"Produits sans prix (None) : {missing}/{len(df)}")
 
     update_excel_history(rows)
 
